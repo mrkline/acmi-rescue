@@ -3,7 +3,7 @@ use std::{
     io::{self, prelude::*},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use camino::Utf8PathBuf;
 use clap::Parser;
 use flate2::read::DeflateDecoder;
@@ -11,19 +11,23 @@ use log::*;
 use simplelog::*;
 use zip::ZipWriter;
 
+/// Rescues a damaged or incomplete Tacview ACMI
 #[derive(Debug, Parser)]
 struct Args {
     /// Verbosity (-v, -vv, -vvv, etc.)
-    #[clap(short, long, parse(from_occurrences))]
+    #[clap(short, long, action=clap::ArgAction::Count)]
     verbose: u8,
 
-    #[clap(short, long, arg_enum, default_value = "auto")]
+    #[clap(short, long, value_enum, default_value = "auto")]
     color: Color,
+
+    #[clap(short, long, id = "FILE", default_value = "rescued.zip.acmi")]
+    output: Utf8PathBuf,
 
     partial_acmi: Utf8PathBuf,
 }
 
-#[derive(Debug, Copy, Clone, clap::ArgEnum)]
+#[derive(Debug, Copy, Clone, clap::ValueEnum)]
 enum Color {
     Auto,
     Always,
@@ -34,27 +38,38 @@ fn run() -> Result<()> {
     let args = Args::parse();
     init_logger(&args);
 
-    let fh = File::open(&args.partial_acmi)?;
-    let acmi = unsafe { memmap::Mmap::map(&fh)? };
+    info!("Opening {}...", args.partial_acmi);
+    let fh = File::open(&args.partial_acmi)
+        .with_context(|| format!("Couldn't open {}", args.partial_acmi))?;
+    let acmi = unsafe {
+        memmap::Mmap::map(&fh).with_context(|| format!("Couldn't map {}", args.partial_acmi))?
+    };
     drop(fh);
 
     let mut acmi: &[u8] = acmi.as_ref();
-    let header = LocalFileHeader::parse_and_consume(&mut acmi);
+
+    info!("Parsing ZIP header...");
+    let header = LocalFileHeader::parse_and_consume(&mut acmi)?;
     debug!("{header:?}");
 
     let decompressor = DeflateDecoder::new(io::Cursor::new(acmi));
 
-    let mut zipper = ZipWriter::new(File::create("rescued.zip.acmi")?);
+    info!("Creating output file");
+    let mut zipper = ZipWriter::new(
+        File::create(&args.output).with_context(|| format!("Couldn't create {}", args.output))?,
+    );
 
     let zip_opts = zip::write::FileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated)
         .large_file(true);
 
-
-    zipper.start_file("acmi.txt", zip_opts)?;
+    zipper
+        .start_file("acmi.txt", zip_opts)
+        .context("Couldn't start writing ZIP output")?;
 
     // Splitting by lines will cut off any incomplete last line with no newline
     // to end it.
+    info!("Rescuing...");
     for line in io::BufReader::new(decompressor).lines() {
         let line = match line {
             Ok(l) => l,
@@ -62,14 +77,20 @@ fn run() -> Result<()> {
                 if e.kind() != io::ErrorKind::InvalidInput {
                     bail!(e);
                 } else {
+                    debug!("End of input: {e}");
                     break;
                 }
             }
         };
+        trace!("{line}");
         writeln!(zipper, "{line}")?;
     }
 
-    zipper.finish()?;
+    zipper
+        .finish()
+        .context("Couldn't finalize ZIP archive")?
+        .flush()
+        .context("Couldn't flush output")?;
 
     Ok(())
 }
@@ -111,7 +132,7 @@ pub struct LocalFileHeader<'a> {
 }
 
 impl<'a> LocalFileHeader<'a> {
-    pub fn parse_and_consume(header: &mut &'a [u8]) -> Self {
+    pub fn parse_and_consume(header: &mut &'a [u8]) -> Result<Self> {
         // 4.3.7  Local file header:
         //
         // local file header signature     4 bytes  (0x04034b50)
@@ -128,7 +149,8 @@ impl<'a> LocalFileHeader<'a> {
         //
         // file name (variable size)
         // extra field (variable size)
-        assert_eq!(header[..4], LOCAL_FILE_HEADER_MAGIC);
+        ensure!(header[..4] == LOCAL_FILE_HEADER_MAGIC, "File doesn't start with ZIP magic bytes");
+        ensure!(header.len() >= 30, "File isn't long enough to be a ZIP archive");
         *header = &header[4..];
         let minimum_extract_version = read_u16(header);
         let flags = read_u16(header);
@@ -144,7 +166,7 @@ impl<'a> LocalFileHeader<'a> {
         let (extra_field, remaining) = remaining.split_at(extra_field_length);
         *header = remaining;
 
-        Self {
+        Ok(Self {
             minimum_extract_version,
             flags,
             compression_method,
@@ -155,7 +177,7 @@ impl<'a> LocalFileHeader<'a> {
             uncompressed_size,
             path,
             extra_field,
-        }
+        })
     }
 }
 
